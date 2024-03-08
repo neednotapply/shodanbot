@@ -11,10 +11,19 @@
 
 import json
 import logging
+
 from ipaddress import ip_address
+import base64
+import io
+import re
+
 import discord
 from discord import Embed
+import discord.errors
+from discord import ui
+
 import shodan
+
 
 # Reset logging configuration to clear any handlers
 logging.root.handlers = []
@@ -36,6 +45,10 @@ logger.addHandler(ch)
 
 # Mute the discord library's logs
 logging.getLogger('discord').setLevel(logging.CRITICAL)
+
+# Specifically mute INFO level logs from discord.gateway
+logging.getLogger('discord.gateway').setLevel(logging.ERROR)
+
 def load_config():
     try:
         with open('config.json', 'r') as file:
@@ -69,14 +82,14 @@ class aclient(discord.Client):
         super().__init__(intents=discord.Intents.default())
         self.shodan = shodan.Shodan(shodan_key)
         self.tree = discord.app_commands.CommandTree(self)
-        self.activity = discord.Activity(type=discord.ActivityType.watching, name="/search")
+        self.activity = discord.Activity(type=discord.ActivityType.watching, name="/shodan")
         self.discord_message_limit = 2000
 
     async def send_split_messages(self, interaction, message: str, require_response=True):
         """Sends a message, and if it's too long for Discord, splits it."""
         # Handle empty messages
         if not message.strip():
-            logger.warning("Attempted to send an empty message.")
+            logging.warning("Attempted to send an empty message.")
             return
 
         # Extract the user's query/command from the interaction to prepend it to the first chunk
@@ -99,6 +112,15 @@ class aclient(discord.Client):
             current_chunk += prepend_text
 
         for line in lines:
+            # If the individual line is too long, split it up before chunking
+            while len(line) > self.discord_message_limit:
+                sub_line = line[:self.discord_message_limit]
+                if len(current_chunk) + len(sub_line) + 1 > self.discord_message_limit:
+                    chunks.append(current_chunk)
+                    current_chunk = ""
+                current_chunk += sub_line + "\n"
+                line = line[self.discord_message_limit:]
+
             # If adding the next line to the current chunk would exceed the Discord message limit
             if len(current_chunk) + len(line) + 1 > self.discord_message_limit:
                 chunks.append(current_chunk)
@@ -111,7 +133,7 @@ class aclient(discord.Client):
 
         # Check if there are chunks to send
         if not chunks:
-            logger.warning("No chunks generated from the message.")
+            logging.warning("No chunks generated from the message.")
             return
 
         # If a response is required and the interaction hasn't been responded to, defer the response
@@ -123,17 +145,21 @@ class aclient(discord.Client):
             await interaction.followup.send(content=chunks[0], ephemeral=False)
             chunks = chunks[1:]  # Remove the first chunk since we've already sent it
         except Exception as e:
-            logger.error(f"Failed to send the first chunk via followup. Error: {e}")
+            logging.error(f"Failed to send the first chunk via followup. Error: {e}")
 
         # Send the rest of the chunks directly to the channel
         for chunk in chunks:
             try:
                 await interaction.channel.send(chunk)
             except Exception as e:
-                logger.error(f"Failed to send a message chunk to the channel. Error: {e}")
+                logging.error(f"Failed to send a message chunk to the channel. Error: {e}")
+
+client = None
 
 async def handle_errors(interaction, error, error_type="Error"):
     error_message = f"{error_type}: {error}"
+    logger.error(f"Error occurred for user {interaction.user} in {interaction.guild.name if interaction.guild else 'Direct Message'}: {error_message}")
+
     try:
         # Check if the interaction has been responded to
         if interaction.response.is_done():
@@ -155,15 +181,320 @@ async def handle_errors(interaction, error, error_type="Error"):
         except Exception as followup_error:
             logger.error(f"Failed to send followup: {followup_error}")
 
-def run_discord_bot(token, shodan_key):
-    client = aclient(shodan_key)
+async def process_shodan_results(interaction: discord.Interaction, result: dict, max_results: int = 10, display_mode: str = "full"):
+    user = interaction.user.name
+    guild_name = interaction.guild.name if interaction.guild else "Direct Message"
+    command_name = interaction.data.get("name", "unknown_command")
+    options = ", ".join([f"{option.get('name')}: {option.get('value')}" for option in interaction.data.get("options", [])])
 
+    logger.info(f"{user} executed /{command_name} from {guild_name}. Options used: {options}")
+
+    print(f"{user} executed /{command_name} from {guild_name}. Options used: {options}")
+
+    matches = result.get('matches', [])
+    if matches:
+        total = result.get('total', 0)
+        info = f"Found {total} results. Here are the top results:\n\n"
+
+        # For list mode, send each IP link and screenshot immediately
+        if display_mode == "easy":
+            for match in matches[:max_results]:
+                ip = match.get('ip_str', 'No IP available.')
+                port = match.get('port', 'No port available.')
+
+                # Format IP link
+                clickable_link = f"[{ip}:{port}](http://{ip}:{port})\n"
+                await interaction.followup.send(clickable_link, ephemeral=True)
+
+                # Handle screenshot if available
+                screenshot_data = match.get('screenshot', {}).get('data')
+                if screenshot_data:
+                    screenshot_bytes = base64.b64decode(screenshot_data)
+                    screenshot_file = io.BytesIO(screenshot_bytes)
+                    await interaction.followup.send(file=discord.File(screenshot_file, filename=f'screenshot_{ip}.jpg'))
+            return 
+        
+        # If display mode is full
+        responses = []  # Initialize the responses list
+        for match in matches[:max_results]:
+            detailed_info = generate_detailed_info(match)
+            responses.append(detailed_info)
+        
+        message = info + "\n".join(responses)
+        await client.send_split_messages(interaction, message)
+    else:
+        # Extract the user's query from the interaction
+        query = ""
+        for option in interaction.data.get("options", []):
+            if option.get("name") == "query":
+                query = option.get("value", "")
+                break
+
+        # If the query is not empty, include it in the response message
+        response_message = "No results found."
+        if query:
+            response_message = f"No results found for the query: `{query}`."
+
+        await interaction.followup.send(response_message)
+        
+def generate_detailed_info(match: dict) -> str:
+    ip = match.get('ip_str', 'No IP available.')
+    port = match.get('port', 'No port available.')
+    org = match.get('org', 'N/A')
+    product = match.get('product', 'N/A')
+    version = match.get('version', 'N/A')
+    data = match.get('data', 'No data available.').strip()
+    asn = match.get('asn', 'N/A')
+    hostnames = ", ".join(match.get('hostnames', [])) or 'N/A'
+    os = match.get('os', 'N/A')
+    timestamp = match.get('timestamp', 'N/A')
+    isp = match.get('isp', 'N/A')
+    http_title = match.get('http', {}).get('title', 'N/A')
+    ssl_data = match.get('ssl', {}).get('cert', {}).get('subject', {}).get('CN', 'N/A')
+    vulns = ", ".join(match.get('vulns', [])) or 'N/A'
+    tags = ", ".join(match.get('tags', [])) or 'N/A'
+    transport = match.get('transport', 'N/A')
+
+    # Location details with Google Maps link
+    lat = match.get('location', {}).get('latitude')
+    long = match.get('location', {}).get('longitude')
+    google_maps_link = f"https://www.google.com/maps?q={lat},{long}" if lat and long else None
+    country = match.get('location', {}).get('country_name', 'N/A')
+    city = match.get('location', {}).get('city', 'N/A')
+    if google_maps_link:
+        location = f"{country} - {city} ([Lat: {lat}, Long: {long}]({google_maps_link}))"
+    else:
+        location = f"{country} - {city} (Lat: {lat}, Long: {long})"
+
+    main_link = f"http://{ip}:{port}"
+
+    detailed_info = (
+        f"**IP:** [{ip}]({main_link})\n"
+        f"**Port:** {port}\n"
+        f"**Transport:** {transport}\n"
+        f"**Organization:** {org}\n"
+        f"**Location:** {location}\n"
+        f"**Product:** {product} {version}\n"
+        f"**ASN:** {asn}\n"
+        f"**Hostnames:** {hostnames}\n"
+        f"**OS:** {os}\n"
+        f"**ISP:** {isp}\n"
+        f"**HTTP Title:** {http_title}\n"
+        f"**SSL Common Name:** {ssl_data}\n"
+        f"**Tags:** {tags}\n"
+        f"**Vulnerabilities:** {vulns}\n"
+        f"**Timestamp:** {timestamp}\n"
+        f"**Data:** {data}\n"
+        f"---"
+    )
+
+    return detailed_info
+
+
+class QueryModal(discord.ui.Modal):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.add_item(discord.ui.TextInput(label="Enter your search query", style=discord.TextStyle.short, custom_id="query_input"))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        query = self.children[0].value  # Extract the query from the modal
+        view = MaxResultsView(query)
+        message = await interaction.followup.send(content="Choose the maximum number of results:", view=view, ephemeral=False)
+        view.query_message_id = message.id 
+      
+class MaxResultsView(discord.ui.View):
+    def __init__(self, query):
+        super().__init__()
+        self.query = query
+        self.message_id = None  # Used for the MaxResultsView message
+        self.query_message_id = None 
+
+    async def handle_search(self, interaction: discord.Interaction, max_results: int):
+        shodan_client = interaction.client.shodan
+        user = interaction.user.name
+        guild_name = interaction.guild.name if interaction.guild else "Direct Message"
+
+        logger.info(f"{user} initiated a search with query '{self.query}' in {guild_name}")
+
+        try:
+            result = shodan_client.search(self.query)
+            matches = result.get('matches', [])
+
+            if matches:
+                limited_matches = matches[:max_results]
+                total = result.get('total', 0)
+                info = f"{user} used /shodan to search for `{self.query}` from {guild_name} and found {total} results. Here are the top {max_results} results:\n\n"
+
+                if self.query_message_id:
+                    try:
+                        message_channel = interaction.channel
+                        query_message = await message_channel.fetch_message(self.query_message_id)
+                        await query_message.edit(content=info, view=None)  # Edit the message to display results
+                        # logger.info(f"Successfully edited QueryModal message with ID: {self.query_message_id} to display results.")
+                    except Exception as e:
+                        logger.error(f"Error editing QueryModal message with ID {self.query_message_id}: {e}")
+
+                await interaction.followup.send(info)
+
+                for match in limited_matches:
+                    ip = match.get('ip_str', 'No IP available.')
+                    port = match.get('port', 'No port available.')
+
+                    # Extract geolocation details for easy mode
+                    lat = match.get('location', {}).get('latitude')
+                    long = match.get('location', {}).get('longitude')
+                    google_maps_link = f"https://www.google.com/maps?q={lat},{long}" if lat and long else None
+                    geolocation_text = f"([map](<{google_maps_link}>))" if google_maps_link else ""
+
+                    # Check if IP is IPv6
+                    if is_ipv6(ip):
+                        clickable_link = f"{ip} (port: {port}) {geolocation_text}"
+                    else:
+                        clickable_link = f"[{ip}:{port}](http://{ip}:{port}) {geolocation_text}"
+                    
+                    await interaction.channel.send(clickable_link)
+
+                    screenshot_data = match.get('screenshot', {}).get('data')
+                    if screenshot_data:
+                        try:
+                            screenshot_bytes = base64.b64decode(screenshot_data)
+                            screenshot_file = io.BytesIO(screenshot_bytes)
+                            screenshot_filename = f"screenshot_{match.get('ip_str', 'unknown')}.jpg"
+                            screenshot_attachment = discord.File(screenshot_file, filename=screenshot_filename)
+                            await interaction.channel.send("**Screenshot:**", file=screenshot_attachment)
+                        except Exception as e:
+                            logger.error(f"Error decoding screenshot data for IP {ip}: {e}")
+                            await interaction.channel.send("**Screenshot:** Error decoding screenshot data.")
+                
+                # Send the entire API response as query.txt
+                query_response = json.dumps(result, indent=2)
+                query_file = discord.File(io.StringIO(query_response), filename="query.txt")
+                await interaction.channel.send(file=query_file)
+            else:
+                await interaction.followup.send(content=f"No results found for the query: `{self.query}`.", ephemeral=True)
+        
+        except shodan.APIError as e:
+            logger.error(f"Shodan API Error for user {user} in {guild_name}: {e}")
+            await interaction.followup.send(content=f"Shodan API Error: {e}", ephemeral=True)
+        except json.JSONDecodeError as e:
+            logger.error(f"Unable to parse JSON response for user {user} in {guild_name}. Error: {e}")
+            logger.error(f"Response content: {e.doc}")
+            await interaction.followup.send(content=f"Unable to parse JSON response. Error: {e}", ephemeral=True)
+        except discord.errors.DiscordServerError as e:
+            logger.error(f"Discord server error occurred for user {user} in {guild_name}: {e}")
+            await interaction.followup.send(content="A Discord server error occurred. Please try again later.", ephemeral=True)
+        except Exception as e:
+            logger.error(f"Unexpected error occurred for user {user} in {guild_name}: {e}")
+            await interaction.followup.send(content=f"An unexpected error occurred: {e}", ephemeral=True)
+        
+
+    async def button_callback(self, interaction: discord.Interaction, max_results: int):
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+
+        # Disable the buttons in the view
+        for child in self.children:
+            child.disabled = True
+
+        # Immediately edit the original QueryModal message to remove the content or view
+        if self.query_message_id:
+            try:
+                message_channel = interaction.channel
+                query_message = await message_channel.fetch_message(self.query_message_id)
+                await query_message.edit(content="Processing your request...", view=None)
+                # logger.info(f"Successfully edited QueryModal message with ID: {self.query_message_id} to indicate processing.")
+            except discord.NotFound:
+                logger.error(f"QueryModal message with ID {self.query_message_id} not found. It might have been deleted.")
+            except discord.Forbidden:
+                logger.error(f"Bot does not have permissions to edit QueryModal message with ID {self.query_message_id}.")
+            except discord.HTTPException as e:
+                logger.error(f"Failed to edit QueryModal message due to HTTPException: {e}")
+            except Exception as e:
+                logger.error(f"Unexpected error occurred when trying to edit QueryModal message with ID {self.query_message_id}: {e}")
+
+        await self.handle_search(interaction, max_results)
+
+
+    @discord.ui.button(label="20", style=discord.ButtonStyle.primary, custom_id="max_results_20")
+    async def twenty_results_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.button_callback(interaction, 20)
+
+    @discord.ui.button(label="50", style=discord.ButtonStyle.primary, custom_id="max_results_50")
+    async def fifty_results_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.button_callback(interaction, 50)
+
+    @discord.ui.button(label="100", style=discord.ButtonStyle.primary, custom_id="max_results_100")
+    async def hundred_results_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.button_callback(interaction, 100)
+
+    @discord.ui.button(label="250", style=discord.ButtonStyle.primary, custom_id="max_results_250")
+    async def two_hundred_fifty_results_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.button_callback(interaction, 250)
+
+
+def setup_bot_commands():
     @client.event
     async def on_ready():
-        await client.tree.sync()
-        logger.info(f'{client.user} is done sleeping. Lets go!')
+        # Print the bot's connection status and list the servers it's connected to
+        print(f'{client.user} has successfully connected to Discord!')
+        print(f'The bot is currently active in {len(client.guilds)} server(s):')
+
+        for guild in client.guilds:
+            print(f'- {guild.name} (ID: {guild.id})')
+
+        # Attempt to sync commands for each guild
+        failed_guilds = []
+        for guild in client.guilds:
+            retry_count = 0
+            while True:
+                try:
+                    await client.tree.sync(guild=guild)
+                    print(f'Successfully synced commands for guild: {guild.name}')
+                    break
+                except discord.errors.HTTPException as e:
+                    if e.status == 429:
+                        retry_after = e.response.headers.get('Retry-After', 5)
+                        retry_after = int(retry_after)
+                        retry_count += 1
+                        logger.warning(f"Rate limited while syncing commands for guild: {guild.name}. Retrying in {retry_after} seconds. Retry attempt: {retry_count}")
+                        await asyncio.sleep(retry_after)
+                    else:
+                        logger.error(f'Failed to sync commands for guild: {guild.name}. Error: {e}')
+                        failed_guilds.append(guild.name)
+                        break
+                except Exception as e:
+                    logger.error(f'Failed to sync commands for guild: {guild.name}. Error: {e}')
+                    failed_guilds.append(guild.name)
+                    break
+
+        if failed_guilds:
+            logger.warning("Failed to sync commands for the following guild(s):")
+            for guild_name in failed_guilds:
+                logger.warning(f'- {guild_name}')
+        else:
+            logger.info("Successfully synced commands for all guilds.")
+
+        try:
+            await client.tree.sync()
+            logger.info("Successfully synced commands globally.")
+        except discord.errors.HTTPException as e:
+            if e.status == 429:
+                retry_after = e.response.headers.get('Retry-After', 5)
+                retry_after = int(retry_after)
+                logger.warning(f"Rate limited while syncing commands globally. Retrying in {retry_after} seconds.")
+                await asyncio.sleep(retry_after)
+                await client.tree.sync()
+            else:
+                logger.error(f'Failed to sync commands globally. Error: {e}')
+        except Exception as e:
+            logger.error(f'Failed to sync commands globally. Error: {e}')
+
+        # Update bot's presence to indicate it's ready
         await client.change_presence(activity=client.activity)
 
+        print('Bot is ready and operational!')
+        
     @client.tree.command(name="hostinfo", description="Get information about a host.")
     async def hostinfo(interaction: discord.Interaction, host_ip: str):
         try:
@@ -186,27 +517,25 @@ def run_discord_bot(token, shodan_key):
         except Exception as e:
             await handle_errors(interaction, e)
             
-    @client.tree.command(
-        name="search",
-        description="Advanced and basic Shodan queries. Use `/help search` for examples."
-    )
-    async def search(interaction: discord.Interaction, query: str, max_results: int = 10, display_mode: str = "full"):
-        """
-        :param query: The Shodan query.
-        :param max_results: The maximum number of results to display. Defaults to 10.
-        :param display_mode: Either "full" for full details or "easy" for list of IP:ports. Defaults to "full".
-        """
-        await interaction.response.defer(ephemeral=False)
-        
+    @client.tree.command(name="shodan", description="Advanced and basic Shodan queries. Use `/help` for examples.")
+    async def search(interaction: discord.Interaction):
         try:
-            query = query.strip()  
-            result = client.shodan.search(query)
-            await process_shodan_results(interaction, result, max_results, display_mode)
-        except shodan.APIError as e:
-            await handle_errors(interaction, e, "Shodan API Error")
-        except Exception as e:
-            await handle_errors(interaction, e)
+            # Log the user and guild information
+            user = interaction.user.name
+            guild_name = interaction.guild.name if interaction.guild else "Direct Message"
+            # logger.info(f"{user} initiated a Shodan search from {guild_name}")
 
+            modal = QueryModal(title="Shodan Search Query")
+            await interaction.response.send_modal(modal)
+
+        except discord.HTTPException as e:
+            logger.error(f"HTTP error while sending the modal to {user} in {guild_name}: {e}")
+            await handle_errors(interaction, e, "HTTP Error")
+
+        except Exception as e:
+            logger.error(f"Unexpected error while processing the search command for {user} in {guild_name}: {e}")
+            await handle_errors(interaction, e)
+            
     @client.tree.command(name="searchcity", description="Search Shodan by city.")
     async def searchcity(interaction: discord.Interaction, city: str):
         city = city.strip()
@@ -258,7 +587,7 @@ def run_discord_bot(token, shodan_key):
             await handle_errors(interaction, e, "Shodan API Error")
         except Exception as e:
             await handle_errors(interaction, e)
-    
+
     @client.tree.command(name="exploitsearch", description="Search for known vulnerabilities using a term.")
     async def exploitsearch(interaction: discord.Interaction, term: str):
         try:
@@ -309,7 +638,6 @@ def run_discord_bot(token, shodan_key):
             tags = client.shodan.exploits.tags(size=size)
             tag_list = ", ".join([tag['value'] for tag in tags['matches']])
             
-            # Improved message formatting for clarity
             if not tag_list:
                 message = "No popular exploit tags found."
             elif size == 1:
@@ -332,7 +660,7 @@ def run_discord_bot(token, shodan_key):
             await handle_errors(interaction, e, "Shodan API Error")
         except Exception as e:
             await handle_errors(interaction, e)
-                       
+                        
     @client.tree.command(name="searchproduct", description="Search devices associated with a specific product.")
     async def searchproduct(interaction: discord.Interaction, product: str):
         try:
@@ -391,6 +719,7 @@ def run_discord_bot(token, shodan_key):
         basic_commands_description = "\n".join([
             f"{command}: {description}" 
             for command, description in {
+                "/shodan": "General use of shodan. This is the main command.",
                 "/hostinfo": "Get information about a host.",
                 "/protocols": "List supported protocols.",
                 "/searchcity": "Search Shodan by city.",
@@ -409,7 +738,7 @@ def run_discord_bot(token, shodan_key):
         embed.add_field(name="Commands & Descriptions", value=basic_commands_description, inline=False)
         
         # Advanced Search Command Header
-        embed.add_field(name="🔴 Advanced Command", value="**Command**: \n`/search [query]`\nSearch Shodan. Click the options for max results and easy mode.", inline=False)
+        embed.add_field(name="🔴 Advanced Command", value="**Command**: \n`/shodan\nSearch Shodan. All options will be provided.", inline=False)
         
         embed.add_field(name="Examples of Basic Searches", value=(
             "- Single IP: `192.168.1.1`\n"
@@ -433,118 +762,9 @@ def run_discord_bot(token, shodan_key):
         
         await interaction.response.send_message(embed=embed, ephemeral=False)
 
-    async def process_shodan_results(interaction: discord.Interaction, result: dict, max_results: int = 10, display_mode: str = "full"):
-        user = interaction.user.name
-        guild_name = interaction.guild.name if interaction.guild else "Direct Message"
-        command_name = interaction.data.get("name", "unknown_command")
-        options = ", ".join([f"{option.get('name')}: {option.get('value')}" for option in interaction.data.get("options", [])])
-
-        print(f"{user} executed /{command_name} from {guild_name}. Options used: {options}")
-
-        matches = result.get('matches', [])
-        if matches:
-            total = result.get('total', 0)
-            info = f"Found {total} results. Here are the top results:\n\n"
-            
-            responses = []
-
-            for match in matches[:max_results]:  
-                ip = match.get('ip_str', 'No IP available.')
-                port = match.get('port', 'No port available.')
-
-                # Extract geolocation details for easy mode
-                lat = match.get('location', {}).get('latitude')
-                long = match.get('location', {}).get('longitude')
-                google_maps_link = f"https://www.google.com/maps?q={lat},{long}" if lat and long else None
-                geolocation_text = f"([map](<{google_maps_link}>))" if google_maps_link else ""
-
-                # If display mode is easy
-                if display_mode == "easy":
-                    # Check if IP is IPv6
-                    if is_ipv6(ip):
-                        clickable_link = f"{ip} (port: {port}) {geolocation_text}"  # Modify this display as required
-                    else:
-                        clickable_link = f"[{ip}:{port}](http://{ip}:{port}) {geolocation_text}"
-                    responses.append(clickable_link)
-                    continue 
-
-                # If display mode is full
-                detailed_info = generate_detailed_info(match)
-                responses.append(detailed_info)
-            
-            message = info + "\n".join(responses)
-            await client.send_split_messages(interaction, message)
-        else:
-            # Extract the user's query from the interaction
-            query = ""
-            for option in interaction.data.get("options", []):
-                if option.get("name") == "query":
-                    query = option.get("value", "")
-                    break
-
-            # If the query is not empty, include it in the response message
-            response_message = "No results found."
-            if query:
-                response_message = f"No results found for the query: `{query}`."
-
-            await interaction.followup.send(response_message)
-
-    def generate_detailed_info(match: dict) -> str:
-        ip = match.get('ip_str', 'No IP available.')
-        port = match.get('port', 'No port available.')
-        org = match.get('org', 'N/A')
-        product = match.get('product', 'N/A')
-        version = match.get('version', 'N/A')
-        data = match.get('data', 'No data available.').strip()
-        asn = match.get('asn', 'N/A')
-        hostnames = ", ".join(match.get('hostnames', [])) or 'N/A'
-        os = match.get('os', 'N/A')
-        timestamp = match.get('timestamp', 'N/A')
-        isp = match.get('isp', 'N/A')
-        http_title = match.get('http', {}).get('title', 'N/A')
-        ssl_data = match.get('ssl', {}).get('cert', {}).get('subject', {}).get('CN', 'N/A')
-        vulns = ", ".join(match.get('vulns', [])) or 'N/A'
-        tags = ", ".join(match.get('tags', [])) or 'N/A'
-        transport = match.get('transport', 'N/A')
-
-        # Location details with Google Maps link
-        lat = match.get('location', {}).get('latitude')
-        long = match.get('location', {}).get('longitude')
-        google_maps_link = f"https://www.google.com/maps?q={lat},{long}" if lat and long else None
-        country = match.get('location', {}).get('country_name', 'N/A')
-        city = match.get('location', {}).get('city', 'N/A')
-        if google_maps_link:
-            location = f"{country} - {city} ([Lat: {lat}, Long: {long}]({google_maps_link}))"
-        else:
-            location = f"{country} - {city} (Lat: {lat}, Long: {long})"
-
-        main_link = f"http://{ip}:{port}"
-
-        detailed_info = (
-            f"**IP:** [{ip}]({main_link})\n"
-            f"**Port:** {port}\n"
-            f"**Transport:** {transport}\n"
-            f"**Organization:** {org}\n"
-            f"**Location:** {location}\n"
-            f"**Product:** {product} {version}\n"
-            f"**ASN:** {asn}\n"
-            f"**Hostnames:** {hostnames}\n"
-            f"**OS:** {os}\n"
-            f"**ISP:** {isp}\n"
-            f"**HTTP Title:** {http_title}\n"
-            f"**SSL Common Name:** {ssl_data}\n"
-            f"**Tags:** {tags}\n"
-            f"**Vulnerabilities:** {vulns}\n"
-            f"**Timestamp:** {timestamp}\n"
-            f"**Data:** {data}\n"
-            f"---"
-        )
-
-        return detailed_info
-
-    client.run(token)
-
 if __name__ == "__main__":
     config = load_config()
     if check_configurations(config):
-        run_discord_bot(config.get("TOKEN"), config.get("SHODAN_KEY"))
+        client = aclient(config.get("SHODAN_KEY"))
+        setup_bot_commands()  
+        client.run(config.get("TOKEN"))
