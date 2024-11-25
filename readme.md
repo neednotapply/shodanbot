@@ -1,5 +1,5 @@
 # ShodanBot
-A Discord bot to interact with the Shodan API, allowing users to fetch information about devices, services, and vulnerabilities.
+A Matrix bot to interact with the Shodan API, allowing users to fetch information about devices, services, and vulnerabilities.
 
 ## Table of Contents
 
@@ -13,7 +13,7 @@ A Discord bot to interact with the Shodan API, allowing users to fetch informati
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/rocketgod-git/shodanbot.git
+   git clone https://github.com/neednotapply/shodanbot.git
    cd shodanbot
    ```
 
@@ -25,13 +25,13 @@ A Discord bot to interact with the Shodan API, allowing users to fetch informati
 
 Before running the bot, you need to set up the `config.json` file:
 
-- `TOKEN`: Your Discord bot token.
+- `TOKEN`: Your Matrix bot token.
 - `SHODAN_API_KEY`: Your Shodan API key.
 
 Example:
 ```json
 {
-    "TOKEN": "YOUR_DISCORD_BOT_TOKEN",
+    "TOKEN": "YOUR_MATRIX_BOT_TOKEN",
     "SHODAN_API_KEY": "YOUR_SHODAN_API_KEY"
 }
 ```
@@ -55,7 +55,7 @@ Invite the bot to your server and use the available commands to interact with Sh
 - `/searchisp <ISP>`: Search devices associated with a specific ISP.
 - `/searchgeo <latitude> <longitude> <radius>`: Search devices around specific GPS coordinates.
 
-For more advanced usage or to get more information about a particular command, use the bot's help command or refer to the bot's command descriptions in Discord.
+For more advanced usage or to get more information about a particular command, use the bot's help command or refer to the bot's command descriptions in Matrix.
 
 ## Contributing
 
